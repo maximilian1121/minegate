@@ -1,0 +1,12 @@
+services:
+  minegate:
+    build: .
+    container_name: minegate
+    ports:
+      - "25565:25565"
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - MINEGATE_CONFIG=/app/config.yaml
+    restart: unless-stopped
