@@ -48,7 +48,7 @@ class RouteManager:
     def get_active_connections(self, subdomain: str) -> int:
         return self.active_connections.get(subdomain.lower(), 0)
 
-    async def get_route(self, subdomain: str) -> Optional[RouteConfig]:
+    def get_route(self, subdomain: str) -> Optional[RouteConfig]:
         return self.routes.get(subdomain.lower())
 
     async def add_route(self, route: RouteConfig) -> None:
@@ -63,7 +63,7 @@ class RouteManager:
         async with self._lock:
             self.routes[route.subdomain.lower()] = route
 
-    async def list_routes(self) -> list[RouteConfig]:
+    def list_routes(self) -> list[RouteConfig]:
         return list(self.routes.values())
 
     def extract_subdomain(self, server_address: str) -> Optional[str]:
@@ -163,11 +163,11 @@ async def handle_client(
                 )
                 await async_write_packet(conn, StatusResponse(data=status_data))
             else:
-                reason = ChatMessage({"text": "You must join a subdomain"})
+                reason = ChatMessage({"text": f"\u00A7cCould not connect you to Minegate!\u00A7r\nYou must join via a subdomain\u00A7r\nExample: play.{config.root_domain}"})
                 await async_write_packet(conn, LoginDisconnect(reason=reason))
             return
 
-        route = await route_manager.get_route(subdomain)
+        route = route_manager.get_route(subdomain)
         if route is None:
             if handshake.next_state == NextState.STATUS:
                 status_data = make_status_response(

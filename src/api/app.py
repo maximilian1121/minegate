@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from ..config.schema import Config, RouteConfig, get_config, save_config
+from ..config.schema import RouteConfig, get_config, save_config
 from ..router.mc_router import RouteManager
 
 logger = logging.getLogger(__name__)
@@ -53,26 +53,14 @@ class RouteResponse(BaseModel):
     active_connections: int
 
 
-async def check_server_status(host: str, port: int) -> bool:
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=3.0
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except Exception:
-        return False
-
-
 @app.get("/route/{subdomain}", response_model=RouteResponse)
 async def get_route(subdomain: str) -> RouteResponse:
     manager = get_route_manager()
-    route = await manager.get_route(subdomain)
+    route = manager.get_route(subdomain)
     if route is None:
         raise HTTPException(status_code=404, detail=f"Route '{subdomain}' not found")
 
-    online = await check_server_status(route.host, route.port)
+    online = await manager.is_server_online(route.host, route.port)
     return RouteResponse(
         subdomain=route.subdomain,
         host=route.host,
@@ -87,7 +75,7 @@ async def create_route(route: RouteCreate) -> RouteResponse:
     manager = get_route_manager()
     config = get_config()
 
-    existing = await manager.get_route(route.subdomain)
+    existing = manager.get_route(route.subdomain)
     if existing:
         raise HTTPException(status_code=409, detail=f"Route '{route.subdomain}' already exists")
 
@@ -100,7 +88,7 @@ async def create_route(route: RouteCreate) -> RouteResponse:
     config.routes.append(new_route)
     save_config(config)
 
-    online = await check_server_status(route.host, route.port)
+    online = await manager.is_server_online(route.host, route.port)
 
     return RouteResponse(
         subdomain=route.subdomain,
@@ -114,11 +102,11 @@ async def create_route(route: RouteCreate) -> RouteResponse:
 @app.get("/routes")
 async def list_routes():
     manager = get_route_manager()
-    routes = await manager.list_routes()
+    routes = manager.list_routes()
 
     async def event_generator():
         for route in routes:
-            online = await check_server_status(route.host, route.port)
+            online = await manager.is_server_online(route.host, route.port)
             data = {
                 "subdomain": route.subdomain,
                 "host": route.host,
@@ -152,7 +140,7 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
     manager = get_route_manager()
     config = get_config()
 
-    existing = await manager.get_route(subdomain)
+    existing = manager.get_route(subdomain)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"Route '{subdomain}' not found")
 
@@ -169,7 +157,7 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
             break
     save_config(config)
 
-    online = await check_server_status(updated_route.host, updated_route.port)
+    online = await manager.is_server_online(updated_route.host, updated_route.port)
 
     return RouteResponse(
         subdomain=updated_route.subdomain,
@@ -203,7 +191,7 @@ async def ws_status(websocket: WebSocket):
             time_prev = now_mono
             ticks += 1
 
-            routes = await manager.list_routes()
+            routes = manager.list_routes()
             route_statuses = []
             for route in routes:
                 online = await manager.is_server_online(route.host, route.port)

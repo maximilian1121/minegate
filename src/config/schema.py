@@ -20,7 +20,7 @@ class Config(BaseModel):
     mc_listen_port: int = 25565
     api_listen_host: str = "0.0.0.0"
     api_listen_port: int = 8000
-    root_domain_motd: str = "Welcome to Minegate"
+    root_domain_motd: str = "\u00A7aWelcome to Minegate\u00A7r\n\u00A7fA fast \u00A7ePy\u00A79thon \u00A7fserver router"
     root_domain_icon: Optional[str] = None
     not_found_motd: str = "Server does not exist"
     not_found_icon: Optional[str] = None
