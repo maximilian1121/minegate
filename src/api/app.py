@@ -167,9 +167,7 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
         active_connections=manager.get_active_connections(subdomain),
     )
 
-
-@app.get("/health")
-async def health() -> dict:
+async def get_status_data() -> dict:
     manager = get_route_manager()
     config = get_config()
     process = psutil.Process(os.getpid())
@@ -202,6 +200,8 @@ async def health() -> dict:
     secs = int(uptime_s % 60)
 
     return {
+        "status": "ok",
+        "root_domain": config.root_domain,
         "uptime": f"{days}d {hours}h {mins}m {secs}s",
         "uptime_seconds": round(uptime_s),
         "process": {
@@ -238,23 +238,18 @@ async def health() -> dict:
         "routes": route_statuses,
     }
 
+@app.get("/health")
+async def health() -> dict:
+    return await get_status_data()
 
 @app.websocket("/ws/status")
 async def ws_status(websocket: WebSocket):
     await websocket.accept()
     manager = get_route_manager()
-    config = get_config()
-    process = psutil.Process(os.getpid())
-    net_prev = psutil.net_io_counters()
-    time_prev = time.monotonic()
     ticks = 0
 
     try:
         while True:
-            now_mono = time.monotonic()
-            now_wall = time.time()
-            dt = now_mono - time_prev
-            time_prev = now_mono
             ticks += 1
 
             routes = manager.list_routes()
@@ -269,83 +264,7 @@ async def ws_status(websocket: WebSocket):
                     "active_connections": manager.get_active_connections(route.subdomain),
                 })
 
-            mem = process.memory_info()
-            mem_full = process.memory_full_info()
-            sys_mem = psutil.virtual_memory()
-            cpu_pct = process.cpu_percent(interval=0)
-            cpu_freq = psutil.cpu_freq()
-            cpu_times = process.cpu_times()
-            net_now = psutil.net_io_counters()
-
-            total_connections = sum(r["active_connections"] for r in route_statuses)
-            online_routes = sum(1 for r in route_statuses if r["online"])
-
-            uptime_s = now_wall - _start_time
-            days = int(uptime_s // 86400)
-            hours = int((uptime_s % 86400) // 3600)
-            mins = int((uptime_s % 3600) // 60)
-            secs = int(uptime_s % 60)
-
-            bytes_sent_rate = (net_now.bytes_sent - net_prev.bytes_sent) / dt if dt > 0 else 0
-            bytes_recv_rate = (net_now.bytes_recv - net_prev.bytes_recv) / dt if dt > 0 else 0
-            pkts_sent_rate = (net_now.packets_sent - net_prev.packets_sent) / dt if dt > 0 else 0
-            pkts_recv_rate = (net_now.packets_recv - net_prev.packets_recv) / dt if dt > 0 else 0
-            net_prev = net_now
-
-            ctx_voluntary = getattr(cpu_times, "voluntary", 0)
-            ctx_involuntary = getattr(cpu_times, "involuntary", 0)
-
-            status = {
-                "uptime": f"{days}d {hours}h {mins}m {secs}s",
-                "uptime_seconds": round(uptime_s),
-                "ticks": ticks,
-                "process": {
-                    "pid": os.getpid(),
-                    "ram_mb": round(mem.rss / (1024 * 1024), 2),
-                    "ram_vms_mb": round(mem.vms / (1024 * 1024), 2),
-                    "ram_shared_mb": round(getattr(mem, "shared", 0) / (1024 * 1024), 2),
-                    "ram_peak_mb": round(getattr(mem_full, "peak_wset", mem.rss) / (1024 * 1024), 2),
-                    "cpu_percent": round(cpu_pct, 1),
-                    "cpu_user": round(cpu_times.user, 2),
-                    "cpu_system": round(cpu_times.system, 2),
-                    "threads": process.num_threads(),
-                    "ctx_switches_voluntary": ctx_voluntary,
-                    "ctx_switches_involuntary": ctx_involuntary,
-                    "open_fds": process.num_fds(),
-                },
-                "system": {
-                    "cpu_count": psutil.cpu_count(),
-                    "cpu_count_physical": psutil.cpu_count(logical=False),
-                    "cpu_percent": psutil.cpu_percent(interval=0),
-                    "cpu_freq_mhz": round(cpu_freq.current, 0) if cpu_freq else None,
-                    "ram_total_mb": round(sys_mem.total / (1024 * 1024), 2),
-                    "ram_used_mb": round(sys_mem.used / (1024 * 1024), 2),
-                    "ram_available_mb": round(sys_mem.available / (1024 * 1024), 2),
-                    "ram_percent": sys_mem.percent,
-                    "ram_buffers_mb": round(getattr(sys_mem, "buffers", 0) / (1024 * 1024), 2),
-                    "ram_cached_mb": round(getattr(sys_mem, "cached", 0) / (1024 * 1024), 2),
-                },
-                "throughput": {
-                    "bytes_sent_per_sec": round(bytes_sent_rate),
-                    "bytes_recv_per_sec": round(bytes_recv_rate),
-                    "bytes_sent_rate_human": _human_bytes(bytes_sent_rate),
-                    "bytes_recv_rate_human": _human_bytes(bytes_recv_rate),
-                    "packets_sent_per_sec": round(pkts_sent_rate, 1),
-                    "packets_recv_per_sec": round(pkts_recv_rate, 1),
-                    "total_bytes_sent": net_now.bytes_sent,
-                    "total_bytes_recv": net_now.bytes_recv,
-                },
-                "network": {
-                    "total_routes": len(route_statuses),
-                    "online_routes": online_routes,
-                    "offline_routes": len(route_statuses) - online_routes,
-                    "total_connections": total_connections,
-                    "root_domain": config.root_domain,
-                },
-                "routes": route_statuses,
-            }
-
-            await websocket.send_text(json.dumps(status, default=str))
+            await websocket.send_text(json.dumps(await get_status_data(), default=str))
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
