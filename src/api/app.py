@@ -21,11 +21,20 @@ app = FastAPI(title="Minegate API", version="1.0.0")
 
 _route_manager: Optional[RouteManager] = None
 _start_time: float = time.time()
+_last_net_check: Optional[dict] = None
 
 
 def set_route_manager(manager: RouteManager) -> None:
     global _route_manager
     _route_manager = manager
+
+
+def _format_bytes_rate(bps: float) -> str:
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if abs(bps) < 1024:
+            return f"{bps:.1f} {unit}"
+        bps /= 1024
+    return f"{bps:.1f} TB/s"
 
 
 def get_route_manager() -> RouteManager:
@@ -189,6 +198,17 @@ async def get_status_data() -> dict:
     cpu_freq = psutil.cpu_freq()
     cpu_times = process.cpu_times()
     net = psutil.net_io_counters()
+    now = time.time()
+
+    global _last_net_check
+    sent_rate_bps = 0.0
+    recv_rate_bps = 0.0
+    if _last_net_check is not None:
+        dt = now - _last_net_check["time"]
+        if dt > 0:
+            sent_rate_bps = (net.bytes_sent - _last_net_check["bytes_sent"]) / dt
+            recv_rate_bps = (net.bytes_recv - _last_net_check["bytes_recv"]) / dt
+    _last_net_check = {"time": now, "bytes_sent": net.bytes_sent, "bytes_recv": net.bytes_recv}
 
     total_connections = sum(r["active_connections"] for r in route_statuses)
     online_routes = sum(1 for r in route_statuses if r["online"])
@@ -227,6 +247,10 @@ async def get_status_data() -> dict:
         "throughput": {
             "total_bytes_sent": net.bytes_sent,
             "total_bytes_recv": net.bytes_recv,
+            "bytes_sent_rate": round(sent_rate_bps, 1),
+            "bytes_recv_rate": round(recv_rate_bps, 1),
+            "bytes_sent_rate_human": _format_bytes_rate(sent_rate_bps),
+            "bytes_recv_rate_human": _format_bytes_rate(recv_rate_bps),
         },
         "network": {
             "total_routes": len(route_statuses),
@@ -245,25 +269,9 @@ async def health() -> dict:
 @app.websocket("/ws/status")
 async def ws_status(websocket: WebSocket):
     await websocket.accept()
-    manager = get_route_manager()
-    ticks = 0
 
     try:
         while True:
-            ticks += 1
-
-            routes = manager.list_routes()
-            route_statuses = []
-            for route in routes:
-                online = await manager.is_server_online(route.host, route.port)
-                route_statuses.append({
-                    "subdomain": route.subdomain,
-                    "host": route.host,
-                    "port": route.port,
-                    "online": online,
-                    "active_connections": manager.get_active_connections(route.subdomain),
-                })
-
             await websocket.send_text(json.dumps(await get_status_data(), default=str))
             await asyncio.sleep(2)
     except WebSocketDisconnect:
