@@ -67,7 +67,12 @@ class RouteManager:
         return list(self.routes.values())
 
     def extract_subdomain(self, server_address: str) -> Optional[str]:
-        address = server_address.lower().rstrip(".")
+        # strip legacy BungeeCord/Velocity IP forwarding junk if present
+        # format: host///real_ip///uuid///forwarding_data
+        address = server_address.split("\x00")[0]  # also nuke FML null byte garbage while we're here
+        address = address.split("///")[0]
+        address = address.lower().rstrip(".")
+
         root = self.config.root_domain.lower().rstrip(".")
         if address == root:
             return None
