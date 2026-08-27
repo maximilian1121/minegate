@@ -170,7 +170,7 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok","root_domain": get_config().root_domain, "uptime_seconds": round(time.time() - _start_time), "uptime": f"{int(time.time() - _start_time)}s"}
 
 
 @app.websocket("/ws/status")
