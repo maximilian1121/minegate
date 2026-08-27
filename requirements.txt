@@ -5,3 +5,5 @@ sse-starlette>=1.8.0
 pydantic>=2.5.0
 mcproto>=0.6.0
 psutil>=5.9.0
+
+starlette

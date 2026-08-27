@@ -11,6 +11,7 @@ import psutil
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.cors import CORSMiddleware
 
 from ..config.schema import RouteConfig, get_config, save_config
 from ..router.mc_router import RouteManager
@@ -18,6 +19,14 @@ from ..router.mc_router import RouteManager
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Minegate API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,          # type: ignore
+    allow_origins=["*"],     # type: ignore
+    allow_credentials=False, # type: ignore
+    allow_methods=["*"],     # type: ignore
+    allow_headers=["*"],     # type: ignore
+)
 
 _route_manager: Optional[RouteManager] = None
 _start_time: float = time.time()
