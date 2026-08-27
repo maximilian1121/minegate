@@ -170,7 +170,73 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok","root_domain": get_config().root_domain, "uptime_seconds": round(time.time() - _start_time), "uptime": f"{int(time.time() - _start_time)}s"}
+    manager = get_route_manager()
+    config = get_config()
+    process = psutil.Process(os.getpid())
+
+    routes = manager.list_routes()
+    route_statuses = []
+    for route in routes:
+        online = await manager.is_server_online(route.host, route.port)
+        route_statuses.append({
+            "subdomain": route.subdomain,
+            "host": route.host,
+            "port": route.port,
+            "online": online,
+            "active_connections": manager.get_active_connections(route.subdomain),
+        })
+
+    mem = process.memory_info()
+    sys_mem = psutil.virtual_memory()
+    cpu_freq = psutil.cpu_freq()
+    cpu_times = process.cpu_times()
+    net = psutil.net_io_counters()
+
+    total_connections = sum(r["active_connections"] for r in route_statuses)
+    online_routes = sum(1 for r in route_statuses if r["online"])
+
+    uptime_s = time.time() - _start_time
+    days = int(uptime_s // 86400)
+    hours = int((uptime_s % 86400) // 3600)
+    mins = int((uptime_s % 3600) // 60)
+    secs = int(uptime_s % 60)
+
+    return {
+        "uptime": f"{days}d {hours}h {mins}m {secs}s",
+        "uptime_seconds": round(uptime_s),
+        "process": {
+            "pid": os.getpid(),
+            "ram_mb": round(mem.rss / (1024 * 1024), 2),
+            "ram_vms_mb": round(mem.vms / (1024 * 1024), 2),
+            "cpu_percent": round(process.cpu_percent(interval=0), 1),
+            "cpu_user": round(cpu_times.user, 2),
+            "cpu_system": round(cpu_times.system, 2),
+            "threads": process.num_threads(),
+            "open_fds": process.num_fds(),
+        },
+        "system": {
+            "cpu_count": psutil.cpu_count(),
+            "cpu_count_physical": psutil.cpu_count(logical=False),
+            "cpu_percent": psutil.cpu_percent(interval=0),
+            "cpu_freq_mhz": round(cpu_freq.current, 0) if cpu_freq else None,
+            "ram_total_mb": round(sys_mem.total / (1024 * 1024), 2),
+            "ram_used_mb": round(sys_mem.used / (1024 * 1024), 2),
+            "ram_available_mb": round(sys_mem.available / (1024 * 1024), 2),
+            "ram_percent": sys_mem.percent,
+        },
+        "throughput": {
+            "total_bytes_sent": net.bytes_sent,
+            "total_bytes_recv": net.bytes_recv,
+        },
+        "network": {
+            "total_routes": len(route_statuses),
+            "online_routes": online_routes,
+            "offline_routes": len(route_statuses) - online_routes,
+            "total_connections": total_connections,
+            "root_domain": config.root_domain,
+        },
+        "routes": route_statuses,
+    }
 
 
 @app.websocket("/ws/status")
