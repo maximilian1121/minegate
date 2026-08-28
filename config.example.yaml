@@ -11,8 +11,20 @@ server_offline_motd: "Server %s is offline!"
 server_offline_icon: null
 routes:
   - subdomain: survival
-    host: 192.168.1.100
-    port: 25565
+    backends:
+      - host: 192.168.1.100
+        port: 25565
+        weight: 1
+        priority: 0
+      - host: 192.168.1.101
+        port: 25565
+        weight: 2
+        priority: 0
+    load_balance:
+      strategy: least_connections
   - subdomain: creative
-    host: 192.168.1.101
-    port: 25565
+    backends:
+      - host: 192.168.1.200
+        port: 25565
+    load_balance:
+      strategy: round_robin

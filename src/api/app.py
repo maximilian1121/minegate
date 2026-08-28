@@ -9,28 +9,35 @@ from typing import Optional
 
 import psutil
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import HTMLResponse
 
-from ..config.schema import RouteConfig, get_config, save_config
-from ..router.mc_router import RouteManager
+from ..config.schema import (
+    BackendConfig,
+    LoadBalanceConfig,
+    LoadBalanceStrategy,
+    RouteConfig,
+    get_config,
+    save_config,
+)
+from ..router.mc_router import RouteManager, _backend_key
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Minegate API", version="1.0.0")
+app = FastAPI(title="Minegate API", version="2.0.0")
 
 app.add_middleware(
-    CORSMiddleware,          # type: ignore
-    allow_origins=["*"],     # type: ignore
-    allow_credentials=False, # type: ignore
-    allow_methods=["*"],     # type: ignore
-    allow_headers=["*"],     # type: ignore
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 _route_manager: Optional[RouteManager] = None
 _start_time: float = time.time()
-_last_net_check: Optional[dict] = None
 
 
 def set_route_manager(manager: RouteManager) -> None:
@@ -52,23 +59,82 @@ def get_route_manager() -> RouteManager:
     return _route_manager
 
 
-class RouteCreate(BaseModel):
-    subdomain: str
+class BackendCreate(BaseModel):
     host: str
     port: int = 25565
+    weight: int = 1
+    priority: int = 0
+
+
+class BackendResponse(BaseModel):
+    host: str
+    port: int
+    weight: int
+    priority: int
+    online: bool
+    active_connections: int
+    ping_ms: Optional[float] = None
+
+
+class LoadBalanceCreate(BaseModel):
+    strategy: LoadBalanceStrategy = LoadBalanceStrategy.round_robin
+
+
+class RouteCreate(BaseModel):
+    subdomain: str
+    backends: list[BackendCreate] = Field(default_factory=list)
+    load_balance: Optional[LoadBalanceCreate] = None
 
 
 class RouteUpdate(BaseModel):
-    host: Optional[str] = None
-    port: Optional[int] = None
+    backends: Optional[list[BackendCreate]] = None
+    load_balance: Optional[LoadBalanceCreate] = None
 
 
 class RouteResponse(BaseModel):
     subdomain: str
-    host: str
-    port: int
-    online: bool
+    backends: list[BackendResponse]
     active_connections: int
+    load_balance_strategy: str
+
+
+def _build_backend_response(
+    manager: RouteManager, subdomain: str, b: BackendConfig
+) -> BackendResponse:
+    return BackendResponse(
+        host=b.host,
+        port=b.port,
+        weight=b.weight,
+        priority=b.priority,
+        online=False,
+        active_connections=manager.get_backend_connections(subdomain, b),
+    )
+
+
+async def _enrich_backend_responses(
+    manager: RouteManager, subdomain: str, backends: list[BackendConfig]
+) -> list[BackendResponse]:
+    responses: list[BackendResponse] = []
+    for b in backends:
+        resp = _build_backend_response(manager, subdomain, b)
+        resp.online = await manager.is_server_online(b.host, b.port)
+        resp.ping_ms = await manager.measure_ping(b.host, b.port)
+        if resp.ping_ms < 0:
+            resp.ping_ms = None
+        responses.append(resp)
+    return responses
+
+
+def _route_response(
+    manager: RouteManager, route: RouteConfig, backend_responses: list[BackendResponse]
+) -> RouteResponse:
+    total_conns = sum(br.active_connections for br in backend_responses)
+    return RouteResponse(
+        subdomain=route.subdomain,
+        backends=backend_responses,
+        active_connections=total_conns,
+        load_balance_strategy=route.load_balance.strategy.value,
+    )
 
 
 @app.get("/route/{subdomain}", response_model=RouteResponse)
@@ -76,45 +142,50 @@ async def get_route(subdomain: str) -> RouteResponse:
     manager = get_route_manager()
     route = manager.get_route(subdomain)
     if route is None:
-        raise HTTPException(status_code=404, detail=f"Route '{subdomain}' not found")
-
-    online = await manager.is_server_online(route.host, route.port)
-    return RouteResponse(
-        subdomain=route.subdomain,
-        host=route.host,
-        port=route.port,
-        online=online,
-        active_connections=manager.get_active_connections(subdomain),
+        raise HTTPException(
+            status_code=404, detail=f"Route '{subdomain}' not found"
+        )
+    backend_responses = await _enrich_backend_responses(
+        manager, subdomain, route.backends
     )
+    return _route_response(manager, route, backend_responses)
 
 
-@app.post("/route", response_model=RouteResponse)
+@app.post("/route", response_model=RouteResponse, status_code=201)
 async def create_route(route: RouteCreate) -> RouteResponse:
     manager = get_route_manager()
     config = get_config()
 
     existing = manager.get_route(route.subdomain)
     if existing:
-        raise HTTPException(status_code=409, detail=f"Route '{route.subdomain}' already exists")
+        raise HTTPException(
+            status_code=409, detail=f"Route '{route.subdomain}' already exists"
+        )
 
+    if not route.backends:
+        raise HTTPException(
+            status_code=422, detail="At least one backend is required"
+        )
+
+    lb = route.load_balance or LoadBalanceCreate()
     new_route = RouteConfig(
         subdomain=route.subdomain,
-        host=route.host,
-        port=route.port,
+        backends=[
+            BackendConfig(
+                host=b.host, port=b.port, weight=b.weight, priority=b.priority
+            )
+            for b in route.backends
+        ],
+        load_balance=LoadBalanceConfig(strategy=lb.strategy),
     )
     await manager.add_route(new_route)
     config.routes.append(new_route)
     save_config(config)
 
-    online = await manager.is_server_online(route.host, route.port)
-
-    return RouteResponse(
-        subdomain=route.subdomain,
-        host=route.host,
-        port=route.port,
-        online=online,
-        active_connections=0,
+    backend_responses = await _enrich_backend_responses(
+        manager, route.subdomain, new_route.backends
     )
+    return _route_response(manager, new_route, backend_responses)
 
 
 @app.get("/routes")
@@ -124,15 +195,11 @@ async def list_routes():
 
     async def event_generator():
         for route in routes:
-            online = await manager.is_server_online(route.host, route.port)
-            data = {
-                "subdomain": route.subdomain,
-                "host": route.host,
-                "port": route.port,
-                "online": online,
-                "active_connections": manager.get_active_connections(route.subdomain),
-            }
-            yield {"event": "route", "data": str(data)}
+            backend_responses = await _enrich_backend_responses(
+                manager, route.subdomain, route.backends
+            )
+            resp = _route_response(manager, route, backend_responses)
+            yield {"event": "route", "data": resp.model_dump_json()}
         yield {"event": "complete", "data": "[]"}
 
     return EventSourceResponse(event_generator())
@@ -145,9 +212,13 @@ async def delete_route(subdomain: str) -> dict:
 
     removed = await manager.remove_route(subdomain)
     if removed is None:
-        raise HTTPException(status_code=404, detail=f"Route '{subdomain}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Route '{subdomain}' not found"
+        )
 
-    config.routes = [r for r in config.routes if r.subdomain.lower() != subdomain.lower()]
+    config.routes = [
+        r for r in config.routes if r.subdomain.lower() != subdomain.lower()
+    ]
     save_config(config)
 
     return {"message": f"Route '{subdomain}' deleted"}
@@ -160,12 +231,31 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
 
     existing = manager.get_route(subdomain)
     if existing is None:
-        raise HTTPException(status_code=404, detail=f"Route '{subdomain}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Route '{subdomain}' not found"
+        )
+
+    new_backends = existing.backends
+    if update.backends is not None:
+        if not update.backends:
+            raise HTTPException(
+                status_code=422, detail="At least one backend is required"
+            )
+        new_backends = [
+            BackendConfig(
+                host=b.host, port=b.port, weight=b.weight, priority=b.priority
+            )
+            for b in update.backends
+        ]
+
+    new_lb = existing.load_balance
+    if update.load_balance is not None:
+        new_lb = LoadBalanceConfig(strategy=update.load_balance.strategy)
 
     updated_route = RouteConfig(
-        subdomain=subdomain,
-        host=update.host if update.host is not None else existing.host,
-        port=update.port if update.port is not None else existing.port,
+        subdomain=existing.subdomain,
+        backends=new_backends,
+        load_balance=new_lb,
     )
     await manager.update_route(updated_route)
 
@@ -175,15 +265,103 @@ async def update_route(subdomain: str, update: RouteUpdate) -> RouteResponse:
             break
     save_config(config)
 
-    online = await manager.is_server_online(updated_route.host, updated_route.port)
-
-    return RouteResponse(
-        subdomain=updated_route.subdomain,
-        host=updated_route.host,
-        port=updated_route.port,
-        online=online,
-        active_connections=manager.get_active_connections(subdomain),
+    backend_responses = await _enrich_backend_responses(
+        manager, subdomain, updated_route.backends
     )
+    return _route_response(manager, updated_route, backend_responses)
+
+
+@app.post("/route/{subdomain}/backend", response_model=BackendResponse, status_code=201)
+async def add_backend(subdomain: str, backend: BackendCreate) -> BackendResponse:
+    manager = get_route_manager()
+    config = get_config()
+
+    route = manager.get_route(subdomain)
+    if route is None:
+        raise HTTPException(
+            status_code=404, detail=f"Route '{subdomain}' not found"
+        )
+
+    for b in route.backends:
+        if b.host == backend.host and b.port == backend.port:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Backend {backend.host}:{backend.port} already exists",
+            )
+
+    new_backend = BackendConfig(
+        host=backend.host,
+        port=backend.port,
+        weight=backend.weight,
+        priority=backend.priority,
+    )
+    updated_route = RouteConfig(
+        subdomain=route.subdomain,
+        backends=[*route.backends, new_backend],
+        load_balance=route.load_balance,
+    )
+    await manager.update_route(updated_route)
+
+    for i, r in enumerate(config.routes):
+        if r.subdomain.lower() == subdomain.lower():
+            config.routes[i] = updated_route
+            break
+    save_config(config)
+
+    online = await manager.is_server_online(backend.host, backend.port)
+    ping_ms = await manager.measure_ping(backend.host, backend.port)
+
+    return BackendResponse(
+        host=backend.host,
+        port=backend.port,
+        weight=backend.weight,
+        priority=backend.priority,
+        online=online,
+        active_connections=0,
+        ping_ms=ping_ms if ping_ms >= 0 else None,
+    )
+
+
+@app.delete("/route/{subdomain}/backend/{host}:{port}")
+async def remove_backend(subdomain: str, host: str, port: int) -> dict:
+    manager = get_route_manager()
+    config = get_config()
+
+    route = manager.get_route(subdomain)
+    if route is None:
+        raise HTTPException(
+            status_code=404, detail=f"Route '{subdomain}' not found"
+        )
+
+    new_backends = [
+        b for b in route.backends if not (b.host == host and b.port == port)
+    ]
+    if len(new_backends) == len(route.backends):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Backend {host}:{port} not found in route '{subdomain}'",
+        )
+    if not new_backends:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot remove the last backend. Delete the route instead.",
+        )
+
+    updated_route = RouteConfig(
+        subdomain=route.subdomain,
+        backends=new_backends,
+        load_balance=route.load_balance,
+    )
+    await manager.update_route(updated_route)
+
+    for i, r in enumerate(config.routes):
+        if r.subdomain.lower() == subdomain.lower():
+            config.routes[i] = updated_route
+            break
+    save_config(config)
+
+    return {"message": f"Backend {host}:{port} removed from route '{subdomain}'"}
+
 
 async def get_status_data() -> dict:
     manager = get_route_manager()
@@ -192,13 +370,29 @@ async def get_status_data() -> dict:
 
     routes = manager.list_routes()
     route_statuses = []
+    total_online_backends = 0
+    total_backends = 0
     for route in routes:
-        online = await manager.is_server_online(route.host, route.port)
+        backend_statuses = []
+        for b in route.backends:
+            total_backends += 1
+            online = await manager.is_server_online(b.host, b.port)
+            if online:
+                total_online_backends += 1
+            backend_statuses.append({
+                "host": b.host,
+                "port": b.port,
+                "weight": b.weight,
+                "priority": b.priority,
+                "online": online,
+                "active_connections": manager.get_backend_connections(
+                    route.subdomain, b
+                ),
+            })
         route_statuses.append({
             "subdomain": route.subdomain,
-            "host": route.host,
-            "port": route.port,
-            "online": online,
+            "load_balance_strategy": route.load_balance.strategy.value,
+            "backends": backend_statuses,
             "active_connections": manager.get_active_connections(route.subdomain),
         })
 
@@ -206,21 +400,12 @@ async def get_status_data() -> dict:
     sys_mem = psutil.virtual_memory()
     cpu_freq = psutil.cpu_freq()
     cpu_times = process.cpu_times()
-    net = psutil.net_io_counters()
-    now = time.time()
 
-    global _last_net_check
-    sent_rate_bps = 0.0
-    recv_rate_bps = 0.0
-    if _last_net_check is not None:
-        dt = now - _last_net_check["time"]
-        if dt > 0:
-            sent_rate_bps = (net.bytes_sent - _last_net_check["bytes_sent"]) / dt
-            recv_rate_bps = (net.bytes_recv - _last_net_check["bytes_recv"]) / dt
-    _last_net_check = {"time": now, "bytes_sent": net.bytes_sent, "bytes_recv": net.bytes_recv}
+    tunnel_throughput = manager.get_tunnel_throughput()
+    sent_rate_bps = tunnel_throughput["bytes_sent_rate"]
+    recv_rate_bps = tunnel_throughput["bytes_recv_rate"]
 
     total_connections = sum(r["active_connections"] for r in route_statuses)
-    online_routes = sum(1 for r in route_statuses if r["online"])
 
     uptime_s = time.time() - _start_time
     days = int(uptime_s // 86400)
@@ -250,30 +435,36 @@ async def get_status_data() -> dict:
             "cpu_freq_mhz": round(cpu_freq.current, 0) if cpu_freq else None,
             "ram_total_mb": round(sys_mem.total / (1024 * 1024), 2),
             "ram_used_mb": round(sys_mem.used / (1024 * 1024), 2),
-            "ram_available_mb": round(sys_mem.available / (1024 * 1024), 2),
+            "ram_available_mb": round(
+                sys_mem.available / (1024 * 1024), 2
+            ),
             "ram_percent": sys_mem.percent,
         },
         "throughput": {
-            "total_bytes_sent": net.bytes_sent,
-            "total_bytes_recv": net.bytes_recv,
-            "bytes_sent_rate": round(sent_rate_bps, 1),
-            "bytes_recv_rate": round(recv_rate_bps, 1),
+            "total_bytes_sent": tunnel_throughput["total_bytes_sent"],
+            "total_bytes_recv": tunnel_throughput["total_bytes_recv"],
+            "bytes_sent_rate": sent_rate_bps,
+            "bytes_recv_rate": recv_rate_bps,
             "bytes_sent_rate_human": _format_bytes_rate(sent_rate_bps),
             "bytes_recv_rate_human": _format_bytes_rate(recv_rate_bps),
+            "per_route": tunnel_throughput["per_route"],
         },
         "network": {
             "total_routes": len(route_statuses),
-            "online_routes": online_routes,
-            "offline_routes": len(route_statuses) - online_routes,
+            "total_backends": total_backends,
+            "online_backends": total_online_backends,
+            "offline_backends": total_backends - total_online_backends,
             "total_connections": total_connections,
             "root_domain": config.root_domain,
         },
         "routes": route_statuses,
     }
 
+
 @app.get("/health")
 async def health() -> dict:
     return await get_status_data()
+
 
 @app.websocket("/ws/status")
 async def ws_status(websocket: WebSocket):
@@ -281,17 +472,11 @@ async def ws_status(websocket: WebSocket):
 
     try:
         while True:
-            await websocket.send_text(json.dumps(await get_status_data(), default=str))
+            await websocket.send_text(
+                json.dumps(await get_status_data(), default=str)
+            )
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-
-
-def _human_bytes(n: float) -> str:
-    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB/s"

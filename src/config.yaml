@@ -3,13 +3,19 @@ mc_listen_host: 0.0.0.0
 mc_listen_port: 25565
 api_listen_host: 0.0.0.0
 api_listen_port: 8000
-root_domain_motd: "\u00A7aWelcome to Minegate\u00A7r\n\u00A7fA fast \u00A7ePy\u00A79thon \u00A7fserver router"
+root_domain_motd: "\xA7aWelcome to Minegate\xA7r\n\xA7fA fast \xA7ePy\xA79thon \xA7\
+  fserver router"
 root_domain_icon: null
-not_found_motd: "Server does not exist"
+not_found_motd: Server does not exist
 not_found_icon: null
-server_offline_motd: "Server %s is offline!"
+server_offline_motd: Server %s is offline!
 server_offline_icon: null
 routes:
 - subdomain: test
-  host: 10.0.12.34
-  port: 62732
+  backends:
+  - host: 10.0.12.34
+    port: 62732
+    weight: 1
+    priority: 0
+  load_balance:
+    strategy: round_robin
